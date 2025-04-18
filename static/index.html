@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Speech Transcription</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        #transcriptionOutput {
+            margin-top: 20px;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            min-height: 200px;
+            white-space: pre-wrap;
+            line-height: 1.6;
+            font-size: 16px;
+        }
+        .transcript-segment {
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        .timestamp {
+            color: #666;
+            font-size: 0.9em;
+            margin-bottom: 8px;
+            font-family: monospace;
+        }
+        .text-content {
+            margin-left: 20px;
+            line-height: 1.4;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            margin-right: 10px;
+        }
+        button:disabled {
+            background-color: #cccccc;
+        }
+        #status {
+            margin-top: 10px;
+            color: #666;
+        }
+        .tab {
+            display: none;
+        }
+        .tab.active {
+            display: block;
+        }
+        .tab-buttons {
+            margin-bottom: 20px;
+        }
+        .tab-button {
+            background-color: #f1f1f1;
+            color: black;
+            padding: 10px 20px;
+            border: none;
+            cursor: pointer;
+            margin-right: 5px;
+        }
+        .tab-button.active {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .file-upload {
+            margin: 20px 0;
+        }
+        #fileUploadStatus {
+            margin-top: 10px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <h1>Speech Transcription</h1>
+    
+    <div class="tab-buttons">
+        <button class="tab-button active" onclick="showTab('live')">Live Recording</button>
+        <button class="tab-button" onclick="showTab('file')">File Upload</button>
+    </div>
+
+    <div id="liveTab" class="tab active">
+        <div class="controls">
+            <button id="startButton">Start Recording</button>
+            <button id="stopButton" disabled>Stop Recording</button>
+        </div>
+        <div id="status">Status: Not recording</div>
+    </div>
+
+    <div id="fileTab" class="tab">
+        <div class="file-upload">
+            <input type="file" id="audioFile" accept="audio/*" />
+            <button onclick="uploadFile()">Upload and Transcribe</button>
+        </div>
+        <div id="fileUploadStatus"></div>
+    </div>
+    
+    <div id="transcriptionOutput"></div>
+
+    <script>
+        let websocket;
+        let mediaRecorder;
+        let audioContext;
+        let startButton = document.getElementById('startButton');
+        let stopButton = document.getElementById('stopButton');
+        let statusDiv = document.getElementById('status');
+        let output = document.getElementById('transcriptionOutput');
+        
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-button').forEach(button => {
+                button.classList.remove('active');
+            });
+            document.querySelector(`[onclick="showTab('${tabName}')"]`).classList.add('active');
+            
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            
+            output.textContent = '';
+        }
+
+        function appendTranscriptSegment(response) {
+            const segmentDiv = document.createElement('div');
+            segmentDiv.className = 'transcript-segment';
+            
+            const timestampDiv = document.createElement('div');
+            timestampDiv.className = 'timestamp';
+            timestampDiv.textContent = `[${response.start_tc} --> ${response.end_tc}]`;
+            
+            const textDiv = document.createElement('div');
+            textDiv.className = 'text-content';
+            textDiv.textContent = response.text;
+            
+            segmentDiv.appendChild(timestampDiv);
+            segmentDiv.appendChild(textDiv);
+            output.appendChild(segmentDiv);
+            
+            // Auto-scroll to bottom
+            output.scrollTop = output.scrollHeight;
+        }
+
+        async function uploadFile() {
+            const fileInput = document.getElementById('audioFile');
+            const file = fileInput.files[0];
+            const statusDiv = document.getElementById('fileUploadStatus');
+            
+            if (!file) {
+                statusDiv.textContent = 'Please select a file first.';
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            statusDiv.textContent = 'Uploading and processing...';
+            output.textContent = '';
+
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error('Upload failed');
+                }
+
+                const result = await response.json();
+                statusDiv.textContent = 'Transcription complete!';
+
+                result.segments.forEach(segment => {
+                    appendTranscriptSegment(segment);
+                });
+
+            } catch (error) {
+                statusDiv.textContent = 'Error: ' + error.message;
+                console.error('Error:', error);
+            }
+        }
+        
+        function initWebSocket() {
+            websocket = new WebSocket(`ws://${window.location.host}/ws`);
+            
+            websocket.onmessage = function(event) {
+                const response = JSON.parse(event.data);
+                
+                if (response.error) {
+                    console.error('Error:', response.error);
+                    return;
+                }
+                
+                appendTranscriptSegment(response);
+            };
+            
+            websocket.onclose = function(event) {
+                console.log('WebSocket connection closed');
+            };
+        }
+        
+        async function initRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new AudioContext();
+                const source = audioContext.createMediaStreamSource(stream);
+                
+                const processor = audioContext.createScriptProcessor(16384, 1, 1);
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                processor.onaudioprocess = function(e) {
+                    if (websocket && websocket.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        
+                        const targetSampleRate = 16000;
+                        let audioData = inputData;
+                        
+                        if (audioContext.sampleRate !== targetSampleRate) {
+                            const ratio = targetSampleRate / audioContext.sampleRate;
+                            audioData = new Float32Array(Math.round(inputData.length * ratio));
+                            for (let i = 0; i < audioData.length; i++) {
+                                audioData[i] = inputData[Math.floor(i / ratio)];
+                            }
+                        }
+                        
+                        const wavBuffer = createWavBuffer(audioData);
+                        
+                        const base64data = 'data:audio/wav;base64,' + btoa(String.fromCharCode(...new Uint8Array(wavBuffer)));
+                        websocket.send(base64data);
+                    }
+                };
+                
+                mediaRecorder = {
+                    stream: stream,
+                    processor: processor,
+                    source: source
+                };
+                
+                startButton.disabled = false;
+                
+            } catch (error) {
+                console.error('Error initializing recording:', error);
+                statusDiv.textContent = 'Error: ' + error.message;
+            }
+        }
+        
+        function createWavBuffer(samples) {
+            const buffer = new ArrayBuffer(44 + samples.length * 2);
+            const view = new DataView(buffer);
+            
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + samples.length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true);
+            view.setUint16(22, 1, true);
+            view.setUint32(24, 16000, true);
+            view.setUint32(28, 16000 * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, samples.length * 2, true);
+            
+            const volume = 1;
+            let index = 44;
+            for (let i = 0; i < samples.length; i++) {
+                view.setInt16(index, samples[i] * 0x7FFF * volume, true);
+                index += 2;
+            }
+            
+            return buffer;
+        }
+        
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+        
+        startButton.onclick = function() {
+            initWebSocket();
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            statusDiv.textContent = 'Status: Recording';
+            output.textContent = '';
+        };
+
+        stopButton.onclick = function() {
+            if (websocket) {
+                websocket.close();
+            }
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            statusDiv.textContent = 'Status: Not recording';
+        };
+        
+        window.onload = initRecording;
+    </script>
+</body>
+</html>

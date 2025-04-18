@@ -130,7 +130,7 @@ class FasterWhisperASR(ASRBase):
     def transcribe(self, audio, init_prompt=""):
 
         # tested: beam_size=5 is faster and better than 1 (on one 200 second document from En ESIC, min chunk 0.01)
-        segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=5, word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
+        segments, info = self.model.transcribe(audio, language=self.original_language, initial_prompt=init_prompt, beam_size=10, word_timestamps=True, condition_on_previous_text=True, **self.transcribe_kargs)
         #print(info)  # info contains language detection result
 
         return list(segments)
@@ -717,7 +717,7 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
             ret = self.online.process_iter()
             return ret
         else:
-            print("no online update, only VAD", self.status, file=self.logfile)
+            # print("no online update, only VAD", self.status, file=self.logfile)
             return (None, None, "")
 
     def finish(self):
@@ -839,6 +839,165 @@ def set_logging(args,logger,other="_server"):
 
 
 
+def split_into_sentences(text):
+    """Split text into sentences using basic punctuation rules."""
+    # Split on sentence ending punctuation followed by space or newline
+    sentences = []
+    current = ""
+    
+    words = text.split()
+    for i, word in enumerate(words):
+        current += word + " "
+        
+        # Check for sentence endings
+        if (word.endswith('.') or word.endswith('!') or word.endswith('?')) and i < len(words) - 1:
+            # Don't split on common abbreviations
+            if not any(word.lower().endswith(abbr) for abbr in ['.jpg', '.png', 'dr.', 'mr.', 'ms.', 'mrs.', 'vs.', 'etc.']):
+                sentences.append(current.strip())
+                current = ""
+                
+    if current:
+        sentences.append(current.strip())
+        
+    return sentences
+
+def seconds_to_timecode(seconds):
+    """Convert seconds to HH:MM:SS format."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
+    else:
+        return f"{minutes:02d}:{seconds:05.2f}"
+
+def split_into_chunks(sentences, max_chars=150):
+    """Split sentences into chunks that don't exceed max_chars."""
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        # If single sentence is longer than max_chars, split it into phrases
+        if len(sentence) > max_chars:
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+            
+            # Split long sentence into phrases by commas and conjunctions
+            phrases = []
+            current_phrase = []
+            words = sentence.split()
+            
+            for word in words:
+                current_phrase.append(word)
+                phrase_text = ' '.join(current_phrase)
+                
+                if len(phrase_text) > max_chars/2 or word.endswith(',') or word in ['ja', 'ning', 'aga', 'kuid', 'vaid', 'või']:
+                    phrases.append(' '.join(current_phrase))
+                    current_phrase = []
+            
+            if current_phrase:
+                phrases.append(' '.join(current_phrase))
+            
+            for phrase in phrases:
+                chunks.append(phrase)
+            
+        else:
+            new_length = current_length + len(sentence) + 1
+            if new_length <= max_chars:
+                current_chunk.append(sentence)
+                current_length = new_length
+            else:
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                current_chunk = [sentence]
+                current_length = len(sentence)
+    
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+    
+    return chunks
+
+def split_segment_into_subsegments(start_time, end_time, text, max_chars=150):
+    """Split a long segment into multiple smaller subsegments."""
+    sentences = split_into_sentences(text)
+    chunks = split_into_chunks(sentences, max_chars)
+    
+    if not chunks:
+        return [(start_time, end_time, text)]
+    
+    # Distribute time proportionally based on chunk lengths
+    total_length = sum(len(chunk) for chunk in chunks)
+    total_duration = end_time - start_time
+    
+    subsegments = []
+    current_time = start_time
+    
+    for i, chunk in enumerate(chunks):
+        chunk_duration = (len(chunk) / total_length) * total_duration
+        chunk_end_time = current_time + chunk_duration
+        
+        if i == len(chunks) - 1:
+            chunk_end_time = end_time  # Ensure last chunk ends at segment end time
+            
+        subsegments.append((current_time, chunk_end_time, chunk))
+        current_time = chunk_end_time
+    
+    return subsegments
+
+def output_transcript(o, now=None, merge_threshold=0.5):
+    """
+    Outputs transcript in a subtitle-like format with timestamps and maximum two lines per segment.
+    """
+    if now is None:
+        now = time.time() - start
+
+    # Static variables to store merged segments
+    if not hasattr(output_transcript, "merged_segments"):
+        output_transcript.merged_segments = []
+        output_transcript.last_end_time = None
+
+    if o[0] is not None:
+        start_time, end_time, text = o
+
+        # Check if the current segment can be merged with the previous one
+        if (
+            output_transcript.last_end_time is not None
+            and start_time - output_transcript.last_end_time <= merge_threshold
+        ):
+            # Merge with the previous segment
+            last_segment = output_transcript.merged_segments.pop()
+            merged_text = f"{last_segment[2]} {text}".strip()
+            output_transcript.merged_segments.append(
+                (last_segment[0], end_time, merged_text)
+            )
+        else:
+            # Start a new segment
+            output_transcript.merged_segments.append((start_time, end_time, text))
+
+        output_transcript.last_end_time = end_time
+
+    # Print merged segments if the current segment is final or no more input
+    if o[0] is None or now is None:
+        for segment in output_transcript.merged_segments:
+            # Split long segments into subsegments
+            subsegments = split_segment_into_subsegments(segment[0], segment[1], segment[2])
+            
+            for sub_start, sub_end, sub_text in subsegments:
+                start_tc = seconds_to_timecode(sub_start)
+                end_tc = seconds_to_timecode(sub_end)
+                print(
+                    f"[{start_tc} --> {end_tc}]:\n{sub_text}\n",
+                    flush=True,
+                )
+            
+        # Clear merged segments after printing
+        output_transcript.merged_segments = []
+        output_transcript.last_end_time = None
+
+
 if __name__ == "__main__":
 
     import argparse
@@ -885,21 +1044,87 @@ if __name__ == "__main__":
     beg = args.start_at
     start = time.time()-beg
 
-    def output_transcript(o, now=None):
-        # output format in stdout is like:
-        # 4186.3606 0 1720 Takhle to je
-        # - the first three words are:
-        #    - emission time from beginning of processing, in milliseconds
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
-        if now is None:
-            now = time.time()-start
-        if o[0] is not None:
-            #print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),file=logfile,flush=True)
-            print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),flush=True)
+    def seconds_to_timecode(seconds):
+        """Convert seconds to HH:MM:SS format."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = seconds % 60
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
         else:
-            # No text, so no output
-            pass
+            return f"{minutes:02d}:{seconds:05.2f}"
+
+    def split_into_two_lines(text, max_chars_per_line=50):
+        """Split text into maximum two lines trying to break at natural points."""
+        if len(text) <= max_chars_per_line:
+            return text
+        
+        words = text.split()
+        first_line = []
+        second_line = []
+        current_len = 0
+        
+        for word in words:
+            if current_len + len(word) + 1 <= max_chars_per_line:
+                first_line.append(word)
+                current_len += len(word) + 1
+            else:
+                second_line.append(word)
+        
+        if not second_line:  # If all words went to first line
+            # Move some words to second line
+            midpoint = len(first_line) // 2
+            second_line = first_line[midpoint:]
+            first_line = first_line[:midpoint]
+        
+        return f"{' '.join(first_line)}\n{' '.join(second_line)}"
+
+    def output_transcript(o, now=None, merge_threshold=0.5):
+        """
+        Outputs transcript in a subtitle-like format with timestamps and maximum two lines per segment.
+        """
+        if now is None:
+            now = time.time() - start
+
+        # Static variables to store merged segments
+        if not hasattr(output_transcript, "merged_segments"):
+            output_transcript.merged_segments = []
+            output_transcript.last_end_time = None
+
+        if o[0] is not None:
+            start_time, end_time, text = o
+
+            # Check if the current segment can be merged with the previous one
+            if (
+                output_transcript.last_end_time is not None
+                and start_time - output_transcript.last_end_time <= merge_threshold
+            ):
+                # Merge with the previous segment
+                last_segment = output_transcript.merged_segments.pop()
+                merged_text = f"{last_segment[2]} {text}".strip()
+                output_transcript.merged_segments.append(
+                    (last_segment[0], end_time, merged_text)
+                )
+            else:
+                # Start a new segment
+                output_transcript.merged_segments.append((start_time, end_time, text))
+
+            output_transcript.last_end_time = end_time
+
+        # Print merged segments if the current segment is final or no more input
+        if o[0] is None or now is None:
+            for segment in output_transcript.merged_segments:
+                start_tc = seconds_to_timecode(segment[0])
+                end_tc = seconds_to_timecode(segment[1])
+                formatted_text = split_into_two_lines(segment[2])
+                print(
+                    f"[{start_tc} --> {end_tc}]:\n{formatted_text}\n",
+                    flush=True,
+                )
+                
+            # Clear merged segments after printing
+            output_transcript.merged_segments = []
+            output_transcript.last_end_time = None
 
     if args.offline: ## offline mode processing (for testing/debugging)
         a = load_audio(audio_path)
