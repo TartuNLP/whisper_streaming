@@ -717,7 +717,7 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
             ret = self.online.process_iter()
             return ret
         else:
-            print("no online update, only VAD", self.status, file=self.logfile)
+            #print("no online update, only VAD", self.status, file=self.logfile)
             return (None, None, "")
 
     def finish(self):

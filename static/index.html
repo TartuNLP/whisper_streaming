@@ -192,7 +192,7 @@
         }
         
         function initWebSocket() {
-            websocket = new WebSocket(`ws://${window.location.host}/ws`);
+            websocket = new WebSocket(`wss://${window.location.host}/ws`);
             
             websocket.onmessage = function(event) {
                 const response = JSON.parse(event.data);
