@@ -33,6 +33,12 @@ COPY . .
 
 RUN mkdir -p model
 
+# Create a startup script
+RUN echo '#!/bin/bash' > /app/start.sh && \
+    echo 'export LD_LIBRARY_PATH=$(python3 -c "import os; import nvidia.cublas.lib; import nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + \":\" + os.path.dirname(nvidia.cudnn.lib.__file__))")' >> /app/start.sh && \
+    echo 'python3 web_server.py' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
 EXPOSE 8000
 
-CMD ["/bin/bash", "-c", "export LD_LIBRARY_PATH=$(python3 -c 'import os; import nvidia.cublas.lib; import nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + \":\" + os.path.dirname(nvidia.cudnn.lib.__file__))') && python3 web_server.py"]
+CMD ["/app/start.sh"]
