@@ -41,11 +41,11 @@ def init_asr(model_dir, language):
     parser.add_argument('--task', type=str, default='transcribe')
     parser.add_argument('--vad', action='store_true', default=True)
     parser.add_argument('--vac', action='store_true', default=True)
-    parser.add_argument('--vac-chunk-size', type=float, default=2.0)
+    parser.add_argument('--vac-chunk-size', type=float, default=5.0)
     parser.add_argument('--backend', type=str, default='faster-whisper')
     parser.add_argument('--buffer_trimming', type=str, default='segment')
     parser.add_argument('--buffer_trimming_sec', type=float, default=20.0)
-    parser.add_argument('--min-chunk-size', type=float, default=5.0)
+    parser.add_argument('--min-chunk-size', type=float, default=1.0)
     parser.add_argument('--log-level', type=str, default='CRITICAL')
     
     args = parser.parse_args([])
@@ -103,9 +103,9 @@ async def websocket_endpoint(websocket: WebSocket):
                             response = {
                                 'start': float(result[0]),
                                 'end': float(result[1]),
-                                'start_tc': start_tc,
+                                'start_tc': start_tc,                                
                                 'end_tc': end_tc,
-                                'text': result[2].strip(),
+                                'text': result[2],
                             }
                             await websocket.send_json(response)
                         
