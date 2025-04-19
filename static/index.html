@@ -19,19 +19,28 @@
             font-size: 16px;
         }
         .transcript-segment {
+            display: inline;
+        }
+        .transcript-segment.file-segment {
+            display: block;
             margin-bottom: 20px;
             padding-bottom: 15px;
             border-bottom: 1px solid #eee;
+        }
+        .text-content {
+            display: inline;
+            margin-left: 0;
+        }
+        .text-content.file-text {
+            display: block;
+            margin-left: 20px;
+            line-height: 1.4;
         }
         .timestamp {
             color: #666;
             font-size: 0.9em;
             margin-bottom: 8px;
             font-family: monospace;
-        }
-        .text-content {
-            margin-left: 20px;
-            line-height: 1.4;
         }
         .controls {
             margin: 20px 0;
@@ -132,23 +141,33 @@
             output.textContent = '';
         }
 
-        function appendTranscriptSegment(response) {
-            const segmentDiv = document.createElement('div');
-            segmentDiv.className = 'transcript-segment';
+        function appendTranscriptSegment(response, isFileUpload = false) {
+            if (isFileUpload) {
+                const segmentDiv = document.createElement('div');
+                segmentDiv.className = 'transcript-segment file-segment';
+                
+                const timestampDiv = document.createElement('div');
+                timestampDiv.className = 'timestamp';
+                timestampDiv.textContent = `[${response.start_tc} --> ${response.end_tc}]`;
+                segmentDiv.appendChild(timestampDiv);
+                
+                const textDiv = document.createElement('div');
+                textDiv.className = 'text-content file-text';
+                textDiv.textContent = response.text;
+                
+                segmentDiv.appendChild(textDiv);
+                output.appendChild(segmentDiv);
+            } else {
+                let text = response.text;
+                if (output.lastChild && 
+                    output.lastChild.textContent && 
+                    /[.!?]$/.test(output.lastChild.textContent.trim())) {
+                    text = '\n' + text.trim();
+                }
+                const textNode = document.createTextNode(text);
+                output.appendChild(textNode);
+            }
             
-            const timestampDiv = document.createElement('div');
-            timestampDiv.className = 'timestamp';
-            timestampDiv.textContent = `[${response.start_tc} --> ${response.end_tc}]`;
-            
-            const textDiv = document.createElement('div');
-            textDiv.className = 'text-content';
-            textDiv.textContent = response.text;
-            
-            segmentDiv.appendChild(timestampDiv);
-            segmentDiv.appendChild(textDiv);
-            output.appendChild(segmentDiv);
-            
-            // Auto-scroll to bottom
             output.scrollTop = output.scrollHeight;
         }
 
@@ -182,7 +201,7 @@
                 statusDiv.textContent = 'Transcription complete!';
 
                 result.segments.forEach(segment => {
-                    appendTranscriptSegment(segment);
+                    appendTranscriptSegment(segment, true);
                 });
 
             } catch (error) {
@@ -192,7 +211,7 @@
         }
         
         function initWebSocket() {
-            websocket = new WebSocket(`wss://${window.location.host}/ws`);
+            websocket = new WebSocket(`ws://${window.location.host}/ws`);
             
             websocket.onmessage = function(event) {
                 const response = JSON.parse(event.data);
