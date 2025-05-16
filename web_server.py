@@ -1,15 +1,14 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 import soundfile as sf
 import io
 import base64
-import json
-import asyncio
 import logging
 import librosa
-from whisper_online import asr_factory, set_logging, OnlineASRProcessor
+from whisper_online import asr_factory, set_logging
 import argparse
 
 def seconds_to_timecode(seconds):
@@ -22,13 +21,14 @@ def seconds_to_timecode(seconds):
     else:
         return f"{minutes:02d}:{seconds:05.2f}"
 
-app = FastAPI()
+# app = FastAPI()
 
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 asr = None
 online = None
+in_use = False
 
 def init_asr(model_dir, language):
     global asr, online
@@ -37,7 +37,7 @@ def init_asr(model_dir, language):
     parser.add_argument('--model_dir', type=str, default=model_dir)
     parser.add_argument('--lan', type=str, default=language)
     parser.add_argument('--model', type=str, default='large-v3-turbo')
-    parser.add_argument('--model_cache_dir', type=str, default=model_dir)
+    parser.add_argument('--model_cache_dir', type=str, default=None)
     parser.add_argument('--task', type=str, default='transcribe')
     parser.add_argument('--vad', action='store_true', default=True)
     parser.add_argument('--vac', action='store_true', default=True)
@@ -53,15 +53,28 @@ def init_asr(model_dir, language):
     
     asr, online = asr_factory(args)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_asr(model_dir="/raid/rauno/whisper-large-v3-turbo-et-subs/ct2/", language="et")
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.get("/")
-async def get():
-    with open("static/index.html") as f:
-        return HTMLResponse(f.read())
+# @app.get("/")
+# async def get():
+#     with open("static/index.html") as f:
+#         return HTMLResponse(f.read())
 
-@app.websocket("/ws")
+@app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
+    global in_use
+    if in_use:
+        await websocket.close(code=4001, reason="Server overloaded")
+
+    in_use = True
     await websocket.accept()
     logger.info("connection open")
     
@@ -137,58 +150,4 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             logger.error(f"Error in cleanup: {str(e)}")
         logger.info("connection closed")
-
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        logger.info(f"Processing uploaded file: {file.filename}")
-        audio_data = await file.read()
-        
-        with io.BytesIO(audio_data) as buffer:
-            audio_array, sample_rate = sf.read(buffer)
-            logger.debug(f"Loaded audio: shape={audio_array.shape}, sample_rate={sample_rate}")
-            
-            if len(audio_array.shape) > 1:
-                audio_array = audio_array.mean(axis=1)
-            
-            audio_array = audio_array.astype(np.float32)
-            if np.abs(audio_array).max() > 1.0:
-                audio_array = audio_array / np.abs(audio_array).max()
-
-            if sample_rate != 16000:
-                audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
-                logger.debug("Resampled audio to 16kHz")
-
-        logger.debug("Starting transcription")
-        result = asr.transcribe(audio_array)
-        logger.debug(f"Transcription complete: {type(result)}")
-
-        transcription_segments = []
-        
-
-        for segment in result:
-            transcription_segments.append({
-                'start': segment.start,
-                'end': segment.end,
-                'text': segment.text.strip(),
-                'start_tc': seconds_to_timecode(segment.start),
-                'end_tc': seconds_to_timecode(segment.end)
-            })
-
-        if not transcription_segments:
-            logger.warning("No transcription segments were generated")
-        else:
-            logger.info(f"Generated {len(transcription_segments)} segments")
-            
-        return JSONResponse(content={"segments": transcription_segments})
-        
-    except Exception as e:
-        logger.error(f"Error processing uploaded file: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-if __name__ == "__main__":
-    import uvicorn
-    init_asr(model_dir="model/", language="et")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        in_use = False
