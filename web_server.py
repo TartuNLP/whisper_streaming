@@ -1,15 +1,39 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
+import string
+import random
 import numpy as np
 import soundfile as sf
 import io
 import base64
 import logging
 import librosa
+
 from whisper_online import asr_factory, set_logging
 import argparse
+
+connections = {}
+
+# https://stackoverflow.com/a/56398787
+def generate_identifier(websocket):
+    global connections
+    identifier = ''
+    alphabet = string.ascii_lowercase + string.digits
+    while identifier == '' or identifier in connections.keys():
+        identifier = ''.join(random.choices(alphabet, k=8))
+
+    connections[identifier] = {"owner": websocket, "listeners": []}
+    return identifier
+
+
+# https://stackoverflow.com/a/16891418
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
 
 def seconds_to_timecode(seconds):
     """Convert seconds to HH:MM:SS format."""
@@ -68,24 +92,55 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 #     with open("static/index.html") as f:
 #         return HTMLResponse(f.read())
 
+@app.websocket("/{connection_id}")
+async def listener_endpoint(websocket: WebSocket, connection_id: str):
+    global connections
+    if connection_id not in connections.keys() or connections[connection_id]["owner"] is None:
+        await websocket.close(code=401, reason="Missing session")
+    else:
+        await websocket.accept()
+        logger.info("Listener open")
+        connections[connection_id]["listeners"].append(websocket)
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            logger.info(f"Listener closed")
+            if connection_id in connections.keys():
+                connections[connection_id]["listeners"].remove(websocket)
+
+
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
-    global in_use
+    global in_use, connections
     if in_use:
-        await websocket.close(code=4001, reason="Server overloaded")
-
-    in_use = True
-    await websocket.accept()
-    logger.info("connection open")
+        await websocket.close(code=401, reason="Server overloaded")
+        return
     
     try:
+        in_use = True
+        await websocket.accept()
+        connection_id = generate_identifier(websocket)
+        await websocket.send_json({"connection_id": connection_id})
+        logger.info(f"Connection {connection_id} open")
+
         online.init()
-        
         while True:
             try:
                 data = await websocket.receive_text()
 
                 if not data:
+                    continue
+
+                if data.startswith("$translation"):
+                    if connections[connection_id]["listeners"]:
+                        text = remove_prefix(data, "$translation")
+                        newline = False
+                        if text.startswith("$newline"):
+                            text = remove_prefix(text, "$newline")
+                            newline = True
+                        for child in connections[connection_id]["listeners"]:
+                            await child.send_json({"translation": True, "newline": newline, "text": text})
                     continue
                     
                 try:
@@ -121,6 +176,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 'text': result[2],
                             }
                             await websocket.send_json(response)
+
+                            for child in connections[connection_id]["listeners"]:
+                                await child.send_json(response)
                         
                 except Exception as e:
                     logger.error(f"Error processing audio chunk: {str(e)}")
@@ -149,5 +207,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
         except Exception as e:
             logger.error(f"Error in cleanup: {str(e)}")
-        logger.info("connection closed")
+        logger.info(f"connection {connection_id} closed")
+        connections[connection_id]["owner"] = None
+        for child_connection in connections[connection_id]["listeners"]:
+            await child_connection.close()
+        connections.pop(connection_id)
         in_use = False
