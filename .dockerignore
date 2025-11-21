@@ -1,0 +1,9 @@
+model/
+.git
+.gitignore
+*.pyc
+__pycache__
+.env
+*.wav
+*.mp3
+.idea/

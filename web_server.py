@@ -1,34 +1,30 @@
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-import string
-import random
-import numpy as np
-import soundfile as sf
 import io
 import base64
-import logging
 import librosa
-
-from whisper_online import asr_factory, set_logging
+import logging
 import argparse
 
-connections = {}
+import numpy as np
+import soundfile as sf
 
-# https://stackoverflow.com/a/56398787
-def generate_identifier(websocket):
-    global connections
-    identifier = ''
-    alphabet = string.ascii_lowercase + string.digits
-    while identifier == '' or identifier in connections.keys():
-        identifier = ''.join(random.choices(alphabet, k=8))
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
+from whisper_online import asr_factory, set_logging, VACOnlineASRProcessor
 
-    connections[identifier] = {"owner": websocket, "listeners": []}
-    return identifier
+listeners = []
+
+# app = FastAPI()
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+asr = None
+online: VACOnlineASRProcessor
+in_use = False
 
 
-# https://stackoverflow.com/a/16891418
+# Copied from https://stackoverflow.com/a/16891418
 def remove_prefix(text, prefix):
     if text.startswith(prefix):
         return text[len(prefix):]
@@ -44,15 +40,6 @@ def seconds_to_timecode(seconds):
         return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
     else:
         return f"{minutes:02d}:{seconds:05.2f}"
-
-# app = FastAPI()
-
-logging.basicConfig(level=logging.ERROR)
-logger = logging.getLogger(__name__)
-
-asr = None
-online = None
-in_use = False
 
 def init_asr(model_dir, language):
     global asr, online
@@ -87,44 +74,41 @@ app = FastAPI(lifespan=lifespan)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# @app.get("/")
-# async def get():
-#     with open("static/index.html") as f:
-#         return HTMLResponse(f.read())
 
-@app.websocket("/{connection_id}")
-async def listener_endpoint(websocket: WebSocket, connection_id: str):
-    global connections
-    if connection_id not in connections.keys() or connections[connection_id]["owner"] is None:
-        await websocket.close(code=401, reason="Missing session")
+@app.get("/check_availability")
+async def check_availability():
+    global in_use
+    if in_use:
+        return status.HTTP_503_SERVICE_UNAVAILABLE
     else:
-        await websocket.accept()
-        logger.info("Listener open")
-        connections[connection_id]["listeners"].append(websocket)
-        try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            logger.info(f"Listener closed")
-            if connection_id in connections.keys():
-                connections[connection_id]["listeners"].remove(websocket)
+        return status.HTTP_200_OK
+
+@app.websocket("/listen")
+async def listener_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("Listener open")
+    listeners.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        logger.info(f"Listener closed")
+        listeners.remove(websocket)
 
 
 @app.websocket("/")
 async def websocket_endpoint(websocket: WebSocket):
-    global in_use, connections
+    global in_use
     if in_use:
-        await websocket.close(code=401, reason="Server overloaded")
+        await websocket.close(code=503, reason="Server overloaded")
         return
     
     try:
         in_use = True
         await websocket.accept()
-        connection_id = generate_identifier(websocket)
-        await websocket.send_json({"connection_id": connection_id})
-        logger.info(f"Connection {connection_id} open")
-
+        logger.info(f"Connection open")
         online.init()
+
         while True:
             try:
                 data = await websocket.receive_text()
@@ -133,13 +117,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 if data.startswith("$translation"):
-                    if connections[connection_id]["listeners"]:
+                    if listeners:
                         text = remove_prefix(data, "$translation")
                         newline = False
                         if text.startswith("$newline"):
                             text = remove_prefix(text, "$newline")
                             newline = True
-                        for child in connections[connection_id]["listeners"]:
+                        for child in listeners:
                             await child.send_json({"translation": True, "newline": newline, "text": text})
                     continue
                     
@@ -177,7 +161,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             }
                             await websocket.send_json(response)
 
-                            for child in connections[connection_id]["listeners"]:
+                            for child in listeners:
                                 await child.send_json(response)
                         
                 except Exception as e:
@@ -207,9 +191,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
         except Exception as e:
             logger.error(f"Error in cleanup: {str(e)}")
-        logger.info(f"connection {connection_id} closed")
-        connections[connection_id]["owner"] = None
-        for child_connection in connections[connection_id]["listeners"]:
+        logger.info(f"Connection closed")
+        for child_connection in listeners:
             await child_connection.close()
-        connections.pop(connection_id)
         in_use = False
